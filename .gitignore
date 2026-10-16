@@ -1,0 +1,9 @@
+*.pt
+*.onnx
+__pycache__/
+.venv/
+.runs/
+runs/
+*.pyc
+.DS_Store
+tmp_smoke*.png
