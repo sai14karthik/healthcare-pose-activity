@@ -26,7 +26,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from activity import ALL_ACTIVITIES, ActivityTracker  # noqa: E402
 from filters import StablePersonIds, draw_person, filter_person_indices  # noqa: E402
-from mjpeg import is_mjpeg_url, is_rtsp_url, iter_mjpeg, iter_rtsp  # noqa: E402
+from mjpeg import (  # noqa: E402
+    VIDEO_SUFFIXES,
+    is_rtsp_url,
+    is_video_file,
+    iter_mjpeg,
+    iter_rtsp,
+    iter_video_loop,
+    source_mode,
+)
 from patients import PersonView, summarize  # noqa: E402
 
 ACTIVITY_COLOR = {
@@ -83,9 +91,9 @@ def view_layout(
     (Sense 480×320, webcam 720p/1080p, RTSP, etc.).
     """
     # Status strip ~5% of frame height (never dominate the picture)
-    hud_h = int(np.clip(round(fh * 0.055), 20, 52))
-    font = float(np.clip(fh / 720.0, 0.32, 0.75))
-    tag_font = float(np.clip(fh / 800.0, 0.35, 0.65))
+    hud_h = int(np.clip(round(fh * 0.062), 22, 60))
+    font = float(np.clip(fh / 640.0, 0.38, 0.88))
+    tag_font = float(np.clip(fh / 700.0, 0.40, 0.76))
     thick = 2 if fh >= 720 else 1
     status_y = max(14, int(hud_h * 0.72))
 
@@ -112,6 +120,79 @@ def view_layout(
         "status_y": status_y,
         "scale": scale,
     }
+
+
+def _fit_hud_lines(text: str, max_width: int, font: float, thick: int, max_lines: int) -> list[str]:
+    """Break a HUD sentence into lines that fit the frame width."""
+    words = text.split()
+    if not words or max_lines < 1:
+        return [text]
+    lines: list[str] = []
+    current: list[str] = []
+    for word in words:
+        trial = " ".join([*current, word])
+        (width, _height), _ = cv2.getTextSize(trial, cv2.FONT_HERSHEY_SIMPLEX, font, thick)
+        if current and width > max_width and len(lines) < max_lines - 1:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current and len(lines) < max_lines:
+        lines.append(" ".join(current))
+    return lines or [text]
+
+
+def _draw_nemotron_line(frame: np.ndarray, text: str, lay: dict) -> None:
+    """Bottom strip so the vision-model read sits apart from the pose HUD."""
+    fh, fw = frame.shape[:2]
+    shown = "Nemotron: " + " ".join(text.split())
+    font = lay["font"]
+    max_w = fw - 16
+    if " Situation: " in shown:
+        head, body = shown.split(" Situation: ", 1)
+        lines = [head, *_fit_hud_lines("Situation: " + body, max_w, font, lay["thick"], 2)]
+    elif " Heard: " in shown:
+        seen, heard = shown.split(" Heard: ", 1)
+        lines = [seen, "Heard: " + heard]
+    else:
+        lines = [shown]
+    bar_h = lay["hud_h"] * len(lines)
+    y0 = max(0, fh - bar_h)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, y0), (fw, fh), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+    font = lay["font"]
+    for line in lines:
+        while font > 0.2:
+            (width, _height), _ = cv2.getTextSize(
+                line, cv2.FONT_HERSHEY_SIMPLEX, font, lay["thick"]
+            )
+            if width <= fw - 16:
+                break
+            font = max(0.2, font * 0.9)
+    for index, line in enumerate(lines):
+        draw = line
+        (width, _height), _ = cv2.getTextSize(
+            draw, cv2.FONT_HERSHEY_SIMPLEX, font, lay["thick"]
+        )
+        while width > fw - 16 and len(draw) > 16:
+            draw = draw[:-4] + "..."
+            (width, _height), _ = cv2.getTextSize(
+                draw, cv2.FONT_HERSHEY_SIMPLEX, font, lay["thick"]
+            )
+        baseline = y0 + int((index + 0.72) * lay["hud_h"])
+        if baseline > fh - 2:
+            baseline = fh - 2
+        cv2.putText(
+            frame,
+            draw,
+            (8, baseline),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font,
+            (240, 240, 240),
+            lay["thick"],
+            cv2.LINE_AA,
+        )
 
 
 def to_display(frame: np.ndarray, scale: float) -> np.ndarray:
@@ -221,7 +302,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--audio",
         action="store_true",
-        help="play audio from an RTSP source via ffplay (default: silent)",
+        help="play the source sound track via ffplay (live RTSP or a video file)",
     )
     ap.add_argument(
         "--view-width",
@@ -239,6 +320,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--canvas",
         default=os.environ.get("POSE_CANVAS", "1280x720"),
         help="display canvas WxH; video is centered (fullscreen-friendly). 0x0=off",
+    )
+    ap.add_argument(
+        "--nemotron",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("POSE_NEMOTRON", "0") == "1",
+        help=(
+            "ask Nemotron to read the room when a fall is suspected, "
+            "and when you press n (NEMOTRON_ENDPOINT / NEMOTRON_MODEL)"
+        ),
     )
     return ap.parse_args(argv)
 
@@ -258,27 +348,33 @@ def parse_canvas(spec: str) -> tuple[int, int]:
 
 
 def resolve_source(raw: str):
+    """Webcam index, URL, or file path. A pasted path may include odd spaces."""
+    raw = raw.strip()
     return int(raw) if raw.isdigit() else raw
 
 
 def audio_playback_command(ffplay: str, source: str) -> list[str]:
-    """Build an audio-only FFmpeg player command for an RTSP source."""
-    return [
+    """Build an audio-only ffplay command. RTSP is forced over TCP."""
+    command = [
         ffplay,
         "-hide_banner",
         "-loglevel",
         "warning",
-        "-rtsp_transport",
-        "tcp",
         "-nodisp",
         "-vn",
-        source,
+        "-autoexit",
     ]
+    if is_rtsp_url(source):
+        command[1:1] = ["-rtsp_transport", "tcp"]
+    else:
+        command[1:1] = ["-probesize", "32", "-analyzeduration", "0"]
+    command.append(source)
+    return command
 
 
 def start_rtsp_audio(source: str, *, enabled: bool = False) -> subprocess.Popen | None:
-    """Play a stream's audio independently so OpenCV remains the video renderer."""
-    if not enabled or not is_rtsp_url(source):
+    """Play a live stream or video file's sound while OpenCV shows the picture."""
+    if not enabled or not (is_rtsp_url(source) or is_video_file(source)):
         return None
     ffplay = shutil.which("ffplay")
     if ffplay is None:
@@ -294,7 +390,8 @@ def start_rtsp_audio(source: str, *, enabled: bool = False) -> subprocess.Popen 
     except OSError as exc:
         print(f"audio: could not start ffplay ({exc})", flush=True)
         return None
-    print(f"audio: playing RTSP audio via {ffplay}", flush=True)
+    kind = "RTSP" if is_rtsp_url(source) else "file"
+    print(f"audio: playing {kind} audio via {ffplay}", flush=True)
     return player
 
 
@@ -371,6 +468,12 @@ def _infer_kwargs(profile: dict, device: str, half: bool) -> dict:
 def main() -> None:
     args = parse_args()
     source = resolve_source(args.source)
+    if (
+        isinstance(source, str)
+        and Path(source).suffix.lower() in VIDEO_SUFFIXES
+        and not Path(source).is_file()
+    ):
+        raise SystemExit(f"video file not found: {source}")
     profile = resolve_profile(args)
     model_name = profile["model"]
     device = pick_device(args.device)
@@ -422,10 +525,12 @@ def main() -> None:
             print(f"track unavailable ({e}); per-frame IDs", flush=True)
             use_ids = False
 
-    # Frame pullers for ESP MJPEG / MediaMTX RTSP (Ultralytics stream often stalls)
-    mjpeg_mode = is_mjpeg_url(source)
-    rtsp_mode = is_rtsp_url(source)
-    frame_mode = mjpeg_mode or rtsp_mode
+    # Frame pullers for ESP MJPEG / MediaMTX RTSP (Ultralytics stream often stalls).
+    # A local video file is a separate loop and does not replace those sources.
+    mode = source_mode(source)
+    mjpeg_mode = mode == "mjpeg"
+    rtsp_mode = mode == "rtsp"
+    frame_mode = mode != "live"
     audio_player = None
     audio_exit_reported = False
     audio_retry_at: float | None = None
@@ -462,7 +567,32 @@ def main() -> None:
                 print(f"track unavailable ({e2}); predict only", flush=True)
                 results_iter, use_ids = _start_stream(predict_kw, False)
 
-    win = "Patient pose + activity (q quit)"
+    scene_asker = None
+    if args.nemotron:
+        from nemotron_scene import SceneAsker, endpoint_open
+
+        think = os.environ.get("NEMOTRON_THINK", "0") == "1"
+
+        scene_asker = SceneAsker(
+            think=think,
+            source=source if isinstance(source, str) else None,
+        )
+        print(
+            f"nemotron: {scene_asker.endpoint} model={scene_asker.model} "
+            f"think={think} (new fall, or press n; source audio when the "
+            f"stream or file has a sound track)",
+            flush=True,
+        )
+        if not endpoint_open(scene_asker.endpoint):
+            print(
+                "nemotron: tunnel is not open, so fall reads will fail until it is. "
+                "Pose labels still run. Leave this SSH session up:\n"
+                "  ssh -N -L 18554:10.128.93.13:8554 "
+                "-L 18000:10.43.41.152:8000 ojl1977@10.128.81.10",
+                flush=True,
+            )
+
+    win = "Patient pose + activity (q quit, n ask)" if args.nemotron else "Patient pose + activity (q quit)"
     canvas_w, canvas_h = parse_canvas(args.canvas)
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     if canvas_w > 0 and canvas_h > 0:
@@ -474,7 +604,7 @@ def main() -> None:
         """Annotate one YOLO result; return False if user quit."""
         nonlocal n, audio_exit_reported, audio_player, audio_retry_at
         n += 1
-        if (
+        if is_rtsp_url(source) and (
             audio_player is not None
             and audio_player.poll() is not None
             and not audio_exit_reported
@@ -483,7 +613,12 @@ def main() -> None:
             audio_player = None
             audio_retry_at = time.monotonic() + 3.0
             audio_exit_reported = True
-        if audio_player is None and audio_retry_at is not None and time.monotonic() >= audio_retry_at:
+        if (
+            is_rtsp_url(source)
+            and audio_player is None
+            and audio_retry_at is not None
+            and time.monotonic() >= audio_retry_at
+        ):
             audio_player = start_rtsp_audio(source, enabled=args.audio)
             audio_retry_at = None
             audio_exit_reported = False
@@ -613,6 +748,16 @@ def main() -> None:
             lay["thick"],
             cv2.LINE_AA,
         )
+        if scene_asker is not None:
+            # Every frame, including an empty list, so a recovered track can re-arm.
+            scene_asker.on_falls(
+                r.orig_img,
+                [
+                    person.track_id
+                    for person in people
+                    if person.activity.label == "fall_suspected"
+                ],
+            )
         if scene.fall_alerts:
             cv2.putText(
                 frame,
@@ -624,6 +769,9 @@ def main() -> None:
                 max(lay["thick"], 2),
                 cv2.LINE_AA,
             )
+        nemotron_line = scene_asker.status_line() if scene_asker is not None else ""
+        if nemotron_line:
+            _draw_nemotron_line(frame, nemotron_line, lay)
         view = to_display(frame, lay["scale"])
         if canvas_w > 0 and canvas_h > 0:
             cw, ch = window_canvas_size(
@@ -634,6 +782,11 @@ def main() -> None:
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             return False
+        if key == ord("n") and scene_asker is not None:
+            if scene_asker.ask_now(r.orig_img):
+                print("nemotron: asking about this frame", flush=True)
+            else:
+                print("nemotron: busy", flush=True)
         if n % 30 == 0:
             acts = {lab: counts[lab] for lab in ALL_ACTIVITIES if counts[lab]}
             print(
@@ -660,15 +813,39 @@ def main() -> None:
                 )
             return model.predict(frame, **infer_kw)
 
-    audio_player = start_rtsp_audio(source, enabled=args.audio)
+    audio_started: float | None = None
+
+    def restart_file_audio() -> None:
+        nonlocal audio_player, audio_started
+        if not is_video_file(source):
+            return
+        stop_audio_player(audio_player)
+        audio_player = start_rtsp_audio(str(source), enabled=args.audio)
+        audio_started = time.monotonic() if audio_player is not None else None
+
+    def file_audio_clock() -> float | None:
+        """Seconds of file audio already heard. ffplay needs a short startup."""
+        if audio_started is None:
+            return None
+        return max(0.0, time.monotonic() - audio_started - 0.12)
+
+    audio_player = None if is_video_file(source) else start_rtsp_audio(source, enabled=args.audio)
     try:
         if frame_mode:
-            frames = (
-                iter_mjpeg(str(source))
-                if mjpeg_mode
-                else iter_rtsp(str(source))
-            )
-            print("opening stream (first frame can take a few seconds)…", flush=True)
+            if mjpeg_mode:
+                frames = iter_mjpeg(str(source))
+                print("opening stream (first frame can take a few seconds)…", flush=True)
+            elif rtsp_mode:
+                frames = iter_rtsp(str(source))
+                print("opening stream (first frame can take a few seconds)…", flush=True)
+            else:
+                frames = iter_video_loop(
+                    str(source),
+                    on_media_time=scene_asker.note_time if scene_asker is not None else None,
+                    on_loop=restart_file_audio if args.audio else None,
+                    sync_to=file_audio_clock if args.audio else None,
+                )
+                print("video file loops until q; Nemotron still uses n or a new fall", flush=True)
             for frame, capture_timestamp in frames:
                 out = _infer_frame(frame)
                 if not out:
@@ -681,6 +858,8 @@ def main() -> None:
                 if not handle_result(r, time.monotonic()):
                     break
     finally:
+        if scene_asker is not None:
+            scene_asker.close()
         stop_audio_player(audio_player)
         cv2.destroyAllWindows()
         print(f"stopped after {n} frames", flush=True)

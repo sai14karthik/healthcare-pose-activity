@@ -28,6 +28,92 @@ def is_rtsp_url(source) -> bool:
     return isinstance(source, str) and source.lower().startswith("rtsp://")
 
 
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
+
+
+def is_video_file(source) -> bool:
+    """A local clip. The live RTSP and webcam sources stay on their own path."""
+    from pathlib import Path
+
+    if not isinstance(source, str) or is_rtsp_url(source) or is_mjpeg_url(source):
+        return False
+    path = Path(source)
+    return path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
+
+
+def source_mode(source) -> str:
+    """Which reader to use. Live camera, RTSP, and a looping file stay separate."""
+    if is_mjpeg_url(source):
+        return "mjpeg"
+    if is_rtsp_url(source):
+        return "rtsp"
+    if is_video_file(source):
+        return "video"
+    return "live"
+
+
+def iter_video_loop(
+    path: str,
+    *,
+    pace: bool = True,
+    on_media_time=None,
+    on_loop=None,
+    sync_to=None,
+) -> Iterator[tuple[np.ndarray, float]]:
+    """
+    Yield frames from a file, then rewind and repeat.
+    Playback follows the file frame rate when inference keeps up.
+    ``sync_to`` returns how many seconds of the sound have played; frames
+    already behind that clock are dropped, and early frames wait.
+    """
+    loop = 0
+    while True:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise ConnectionError(f"video open failed: {path}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if fps < 1.0 or fps > 240.0:
+            fps = 30.0
+        period = 1.0 / fps
+        counted = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        loop += 1
+        print(
+            f"video: loop {loop} {path} fps={fps:.1f} frames={counted or '?'}",
+            flush=True,
+        )
+        if on_loop is not None:
+            on_loop()
+        frames = 0
+        deadline = time.monotonic()
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                frames += 1
+                media_t = frames / fps
+                if sync_to is not None:
+                    target = sync_to()
+                    if target is not None and media_t + 0.04 < target:
+                        continue
+                    if target is not None and media_t > target:
+                        time.sleep(min(media_t - target, 0.5))
+                elif pace:
+                    delay = deadline - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    deadline += period
+                    if time.monotonic() - deadline > period:
+                        deadline = time.monotonic()
+                if on_media_time is not None:
+                    on_media_time(media_t)
+                yield frame, time.monotonic()
+        finally:
+            cap.release()
+        if frames == 0:
+            raise ConnectionError(f"video has no frames: {path}")
+
+
 def iter_rtsp(
     url: str,
     *,
